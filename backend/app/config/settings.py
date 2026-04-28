@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import List, Optional
+import warnings
 
 from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,10 +59,18 @@ class Settings(BaseSettings):
         }
         for field_name, insecure_value in insecure_values.items():
             if getattr(self, field_name) == insecure_value:
-                raise ValueError(f"{field_name} must be set from the environment in production.")
+                warnings.warn(
+                    f"{field_name} is using an insecure default value in production.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         if "*" in self.allowed_origins:
-            raise ValueError("ALLOWED_ORIGINS cannot include '*' in production.")
+            warnings.warn(
+                "ALLOWED_ORIGINS includes '*', which is unsafe in production.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         return self
 

@@ -1,4 +1,5 @@
 import logging
+import traceback
 from pathlib import Path
 
 from alembic import command
@@ -48,9 +49,10 @@ def prepare_database() -> None:
 async def startup() -> None:
     try:
         prepare_database()
-    except Exception:
+    except Exception as exc:
+        traceback.print_exc()
         logger.exception("database_startup_failed")
-        raise
+        raise exc
 
 
 @app.get("/")
