@@ -1,147 +1,206 @@
-/**
- * API service for communicating with the backend.
- */
+const rawApiBase = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000/api/v1';
+const API_BASE = rawApiBase.endsWith('/api/v1')
+  ? rawApiBase
+  : `${rawApiBase.replace(/\/$/, '')}/api/v1`;
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8002/api';
+function getStoredToken() {
+  return localStorage.getItem('inventai_token') || '';
+}
+
+function clearAuthAndRedirect() {
+  localStorage.removeItem('inventai_token');
+  localStorage.removeItem('inventai_user');
+  if (window.location.pathname !== '/') {
+    window.location.href = '/';
+  }
+}
+
+function normalizeNetworkError(error) {
+  if (error instanceof Error) {
+    if (error.message === 'Failed to fetch') {
+      return new Error('Unable to reach the server. Check your connection and try again.');
+    }
+    return error;
+  }
+  return new Error('An unexpected network error occurred.');
+}
 
 async function handleResponse(response) {
-  if (!response.ok) {
-    let errorDetail = 'Request failed';
-    try {
-      const error = await response.json();
-      errorDetail = error.detail || error.message || JSON.stringify(error);
-    } catch (e) {
-      errorDetail = `Server returned ${response.status}: ${response.statusText}`;
-    }
-    throw new Error(errorDetail);
+  if (response.status === 401) {
+    clearAuthAndRedirect();
+    throw new Error('Your session expired. Please sign in again.');
   }
+
+  if (!response.ok) {
+    let detail = 'Request failed';
+    try {
+      const payload = await response.json();
+      detail = payload.detail || payload.message || JSON.stringify(payload);
+    } catch {
+      detail = `Server returned ${response.status}: ${response.statusText}`;
+    }
+    throw new Error(detail);
+  }
+
+  if (response.status === 204) {
+    return null;
+  }
+
   return response.json();
 }
 
-export const api = {
-  // Health check
-  async health() {
+async function handleStreamingResponse(response) {
+  if (response.status === 401) {
+    clearAuthAndRedirect();
+    throw new Error('Your session expired. Please sign in again.');
+  }
+
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || '';
+    let detail = 'Request failed';
     try {
-      const response = await fetch(`${API_BASE}/health`);
-      return handleResponse(response);
-    } catch (err) {
-      throw new Error("Cannot connect to server. Is the backend running?");
-    }
-  },
-
-  // Initialize database
-  async initDb() {
-    const response = await fetch(`${API_BASE}/init-db`, { method: 'POST' });
-    return handleResponse(response);
-  },
-
-  // Upload sales CSV
-  async uploadSales(file) {
-    const formData = new FormData();
-    formData.append('file', file);
-
-    try {
-      const response = await fetch(`${API_BASE}/upload-sales`, {
-        method: 'POST',
-        body: formData,
-      });
-      return handleResponse(response);
-    } catch (err) {
-      if (err.message.includes('Failed to fetch')) {
-        throw new Error("Network error: Could not reach the server. Please ensure the backend is running.");
+      if (contentType.includes('application/json')) {
+        const payload = await response.json();
+        detail = payload.detail || payload.message || JSON.stringify(payload);
+      } else {
+        detail = (await response.text()) || `Server returned ${response.status}: ${response.statusText}`;
       }
-      throw err;
+    } catch {
+      detail = `Server returned ${response.status}: ${response.statusText}`;
     }
-  },
+    throw new Error(detail);
+  }
 
-  // Get all stores
-  async getStores() {
-    const response = await fetch(`${API_BASE}/stores`);
+  return response;
+}
+
+async function request(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  const token = getStoredToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  try {
+    const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
     return handleResponse(response);
-  },
+  } catch (error) {
+    throw normalizeNetworkError(error);
+  }
+}
 
-  // Get store details
-  async getStore(storeId) {
-    const response = await fetch(`${API_BASE}/stores/${storeId}`);
-    return handleResponse(response);
-  },
-
-  // Get store SKUs
-  async getStoreSKUs(storeId) {
-    const response = await fetch(`${API_BASE}/stores/${storeId}/skus`);
-    return handleResponse(response);
-  },
-
-  // Run forecast
-  async runForecast(storeId, horizon = 7, skuIds = null) {
-    const response = await fetch(`${API_BASE}/run-forecast`, {
+export const api = {
+  async googleAuth(credential) {
+    return request('/auth/google', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        store_id: storeId,
-        horizon,
-        sku_ids: skuIds,
-      }),
+      body: JSON.stringify({ credential }),
     });
-    return handleResponse(response);
   },
-
-  // Get forecasts
-  async getForecast(storeId, horizon = 7, skuId = null) {
-    let url = `${API_BASE}/get-forecast?store_id=${storeId}&horizon=${horizon}`;
-    if (skuId) {
-      url += `&sku_id=${skuId}`;
-    }
-    const response = await fetch(url);
-    return handleResponse(response);
+  async me() {
+    return request('/auth/me');
   },
-
-  // Get reorder list (THE MONEY ENDPOINT)
-  async getReorderList(storeId, horizon = 7, regenerate = true) {
-    const url = `${API_BASE}/get-reorder-list?store_id=${storeId}&horizon=${horizon}&regenerate=${regenerate}`;
-    const response = await fetch(url);
-    return handleResponse(response);
+  async health() {
+    return request('/health');
   },
-
-  // Get reorder summary
-  async getReorderSummary(storeId) {
-    const response = await fetch(`${API_BASE}/reorder-summary?store_id=${storeId}`);
-    return handleResponse(response);
+  async getStores() {
+    return request('/products/stores');
   },
-
-  // Get festivals
-  async getFestivals() {
-    const response = await fetch(`${API_BASE}/festivals`);
-    return handleResponse(response);
+  async getStore(storeId) {
+    return request(`/products/stores/${storeId}`);
   },
-
-  // Seed festivals
-  async seedFestivals(year) {
-    const response = await fetch(`${API_BASE}/festivals/seed?year=${year}`, { method: 'POST' });
-    return handleResponse(response);
+  async getStoreSKUs(storeId) {
+    return request(`/products/stores/${storeId}/skus`);
   },
-
-  // Update stock levels
   async updateStock(storeId, updates) {
-    const response = await fetch(`${API_BASE}/stores/${storeId}/update-stock`, {
+    return request(`/products/stores/${storeId}/update-stock`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     });
-    return handleResponse(response);
   },
-
-  // Get external market prices (Mandi Prices)
+  async uploadPreview(file, mapping = null) {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (mapping) formData.append('mapping', JSON.stringify(mapping));
+    return request('/products/upload-preview', { method: 'POST', body: formData });
+  },
+  async uploadSales(file, mapping = null, excludedRows = []) {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (mapping) formData.append('mapping', JSON.stringify(mapping));
+    formData.append('excluded_rows', JSON.stringify(excludedRows));
+    return request('/products/upload-sales', { method: 'POST', body: formData });
+  },
+  async runForecast(storeId, horizon = 7, skuIds = null, model = 'arima') {
+    return request('/forecast/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store_id: storeId, horizon, sku_ids: skuIds, model }),
+    });
+  },
+  async getForecastStatus(taskId) {
+    return request(`/forecast/status/${taskId}`);
+  },
+  async getForecast(storeId, horizon = 7, skuId = null) {
+    const params = new URLSearchParams({ store_id: storeId, horizon: String(horizon) });
+    if (skuId) params.set('sku_id', skuId);
+    return request(`/forecast?${params.toString()}`);
+  },
+  async getReorderList(storeId, horizon = 7, regenerate = true) {
+    const params = new URLSearchParams({ store_id: storeId, horizon: String(horizon), regenerate: String(regenerate) });
+    return request(`/reorder/list?${params.toString()}`);
+  },
+  async getReorderSummary(storeId) {
+    return request(`/reorder/summary?store_id=${encodeURIComponent(storeId)}`);
+  },
   async getMandiPrices(commodity = null, state = null) {
-    let url = `${API_BASE}/mandi-prices`;
     const params = new URLSearchParams();
-    if (commodity) params.append('commodity', commodity);
-    if (state) params.append('state', state);
-    if (params.toString()) url += `?${params.toString()}`;
-
-    const response = await fetch(url);
-    return handleResponse(response);
+    if (commodity) params.set('commodity', commodity);
+    if (state) params.set('state', state);
+    return request(`/mandi/prices${params.toString() ? `?${params.toString()}` : ''}`);
+  },
+  async getAlerts() {
+    return request('/alerts');
+  },
+  async dismissAlert(alertId) {
+    return request(`/alerts/${alertId}/dismiss`, { method: 'POST' });
+  },
+  async getSettings() {
+    return request('/settings');
+  },
+  async updateSettings(payload) {
+    return request('/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
+  async getFestivals() {
+    return request('/settings/festivals');
+  },
+  async seedFestivals(year) {
+    return request(`/settings/festivals/seed?year=${year}`, { method: 'POST' });
+  },
+  streamChat(payload) {
+    const token = getStoredToken();
+    return fetch(`${API_BASE}/ai/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+      .then(handleStreamingResponse)
+      .catch((error) => {
+        throw normalizeNetworkError(error);
+      });
   },
 };
+
+export function clearAuthStorage() {
+  localStorage.removeItem('inventai_token');
+  localStorage.removeItem('inventai_user');
+}
 
 export default api;

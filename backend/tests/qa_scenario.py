@@ -7,10 +7,10 @@ import json
 BASE_URL = "http://localhost:8000/api"
 
 def print_pass(msg):
-    print(f"✅ PASS: {msg}")
+    print(f"PASS: {msg}")
 
 def print_fail(msg):
-    print(f"❌ FAIL: {msg}")
+    print(f"FAIL: {msg}")
 
 def test_health():
     try:
@@ -78,7 +78,7 @@ def test_reorder_logic():
         print_fail(f"Failed to get reorder list: {r.text}")
 
 def main():
-    print("🚀 Starting Extensive QA...")
+    print("Starting Extensive QA...")
     test_health()
     test_magic_upload()
     test_reorder_logic()

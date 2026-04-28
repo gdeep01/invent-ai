@@ -1,89 +1,99 @@
-"""
-Pydantic Schemas for API validation and serialization.
-
-These schemas define the contract between frontend and backend:
-- Request validation
-- Response serialization
-- CSV upload validation
-"""
-
 from datetime import date, datetime
-from typing import Optional, List
+from typing import List, Optional
+
 from pydantic import BaseModel, Field, field_validator
-from enum import Enum
 
 
-# ============== Enums ==============
-
-class ForecastModelType(str, Enum):
-    """Forecasting model types."""
-    NAIVE = "naive"
-    MOVING_AVERAGE = "moving_average"
-    ARIMA = "arima"
-    ARIMAX = "arimax"
+class AuthUserResponse(BaseModel):
+    id: int
+    email: str
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 
-class UrgencyLevel(str, Enum):
-    """Reorder urgency levels."""
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: AuthUserResponse
 
 
-# ============== CSV Upload ==============
+class GoogleAuthRequest(BaseModel):
+    credential: str = Field(..., min_length=1)
+
+
+class FestivalMultiplierSchema(BaseModel):
+    category: str
+    multiplier: float = Field(..., ge=0.1, le=5.0)
+
+
+class UserSettingsResponse(BaseModel):
+    has_gemini_api_key: bool
+    notification_threshold_days: int
+    festival_multipliers: List[FestivalMultiplierSchema] = []
+
+
+class UserSettingsUpdate(BaseModel):
+    gemini_api_key: Optional[str] = None
+    notification_threshold_days: int = Field(default=7, ge=1, le=60)
+    festival_multipliers: List[FestivalMultiplierSchema] = []
+
 
 class SalesRowSchema(BaseModel):
-    """
-    Single row from CSV upload.
-    MANDATORY schema - everything converts to this.
-    """
     store_id: str = Field(..., min_length=1, max_length=50)
     sku_id: str = Field(..., min_length=1, max_length=50)
-    sku_name: str = Field(..., min_length=1, max_length=300)
+    sku_name: str = Field(default="Unknown", min_length=1, max_length=300)
     date: date
     units_sold: int = Field(..., ge=0)
     price: Optional[float] = Field(None, ge=0)
     discount: Optional[float] = Field(None, ge=0, le=100)
     category: Optional[str] = None
 
-    @field_validator('date', mode='before')
+    @field_validator("date", mode="before")
     @classmethod
-    def parse_date(cls, v):
-        """Parse various date formats."""
-        if isinstance(v, date):
-            return v
-        if isinstance(v, str):
-            # Try common formats
-            for fmt in ['%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y']:
+    def parse_date(cls, value):
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
                 try:
-                    return datetime.strptime(v, fmt).date()
+                    return datetime.strptime(value, fmt).date()
                 except ValueError:
                     continue
-            raise ValueError(f"Cannot parse date: {v}")
-        return v
+        return value
+
+
+class CSVMappingSuggestion(BaseModel):
+    mapping: dict[str, str]
+    missing_columns: List[str] = []
+    used_ai: bool = False
+    note: Optional[str] = None
+
+
+class UploadAnomaly(BaseModel):
+    row_index: int
+    sku_name: str
+    date: date
+    units_sold: float
+    note: str
+
+
+class CSVPreviewResponse(BaseModel):
+    success: bool
+    suggestion: CSVMappingSuggestion
+    sample_columns: List[str]
+    anomalies: List[UploadAnomaly] = []
 
 
 class CSVUploadResponse(BaseModel):
-    """Response after CSV upload."""
     success: bool
     rows_processed: int
     rows_failed: int
     errors: List[str] = []
     store_id: Optional[str] = None
-
-
-# ============== Store ==============
-
-class StoreCreate(BaseModel):
-    """Create a new store."""
-    store_id: str
-    name: str
-    location: Optional[str] = None
+    anomalies: List[UploadAnomaly] = []
 
 
 class StoreResponse(BaseModel):
-    """Store response."""
     id: int
     store_id: str
     name: str
@@ -94,10 +104,7 @@ class StoreResponse(BaseModel):
         from_attributes = True
 
 
-# ============== SKU ==============
-
 class SKUResponse(BaseModel):
-    """SKU response."""
     id: int
     sku_id: str
     sku_name: str
@@ -109,69 +116,66 @@ class SKUResponse(BaseModel):
 
 
 class StockUpdateRequest(BaseModel):
-    """Update current stock for SKU."""
     sku_id: str
     current_stock: int = Field(..., ge=0)
 
 
-# ============== Forecast ==============
-
 class ForecastRequest(BaseModel):
-    """Request to run forecast."""
     store_id: str
-    sku_ids: Optional[List[str]] = None  # None = all SKUs
+    sku_ids: Optional[List[str]] = None
     horizon: int = Field(default=7, ge=1, le=30)
+    model: str = Field(default="arima")
 
 
 class ForecastResultSchema(BaseModel):
-    """Single forecast result."""
     sku_id: str
     sku_name: str
     forecast_date: date
     predicted_units: float
     confidence_lower: Optional[float]
     confidence_upper: Optional[float]
-    model_used: ForecastModelType
-
-    class Config:
-        from_attributes = True
+    model_used: str
+    health_score: Optional[float] = None
+    festival_boost_applied: bool = False
 
 
 class ForecastResponse(BaseModel):
-    """Response with forecast results."""
     store_id: str
     horizon: int
     generated_at: datetime
     total_predicted: float
     forecasts: List[ForecastResultSchema]
     insights: List[str] = []
+    mae_score: Optional[float] = None
+    last_run_at: Optional[datetime] = None
 
 
-# ============== Reorder Recommendations ==============
+class ForecastTaskResponse(BaseModel):
+    success: bool
+    task_id: str
+    status: str
+    forecast_run_id: int
+
+
+class ForecastTaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    error_message: Optional[str] = None
+    result: Optional[dict] = None
+
 
 class ReorderItem(BaseModel):
-    """
-    Single reorder recommendation.
-    THIS is what the kirana owner sees.
-    Must be understandable in 10 seconds.
-    """
     sku_id: str
     sku_name: str
     reorder_qty: int
-    reason: str  # Human-readable: "40% increase vs last week"
-    urgency: UrgencyLevel
+    reason: str
+    urgency: str
     forecasted_demand: float
     current_stock: int
     velocity_change_pct: Optional[float] = None
 
-    class Config:
-        from_attributes = True
-
 
 class ReorderListResponse(BaseModel):
-    """
-    Complete reorder list for a store.
-    """
     store_id: str
     store_name: str
     generated_at: datetime
@@ -181,7 +185,6 @@ class ReorderListResponse(BaseModel):
 
 
 class ReorderSummary(BaseModel):
-    """Quick summary for dashboard."""
     total_items: int
     critical: int
     high: int
@@ -190,33 +193,34 @@ class ReorderSummary(BaseModel):
     estimated_value: Optional[float] = None
 
 
-# ============== Metrics ==============
+class AlertResponse(BaseModel):
+    id: int
+    message: str
+    severity: str
+    is_dismissed: bool
+    created_at: datetime
 
-class AccuracyMetrics(BaseModel):
-    """Forecast accuracy metrics."""
-    mape: float  # Mean Absolute Percentage Error
-    rmse: float  # Root Mean Square Error
-    accuracy_pct: float  # 100 - MAPE
-    data_points: int
-
-
-# ============== Festival ==============
-
-class FestivalCreate(BaseModel):
-    """Create festival config."""
-    name: str
-    date: date
-    region: Optional[str] = None
-    impact_multiplier: float = Field(default=1.5, ge=1.0)
+    class Config:
+        from_attributes = True
 
 
 class FestivalResponse(BaseModel):
-    """Festival response."""
     id: int
     name: str
     date: date
     region: Optional[str]
     impact_multiplier: float
+    category: Optional[str]
 
     class Config:
         from_attributes = True
+
+
+class AIChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class AIChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    conversation_history: List[AIChatMessage] = []

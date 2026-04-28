@@ -1,35 +1,74 @@
-"""
-Application settings and configuration.
-"""
+from functools import lru_cache
+from typing import List, Optional
 
-from pydantic_settings import BaseSettings
-from typing import Optional
+from pydantic import Field, computed_field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application configuration using environment variables."""
-    
-    # Database
-    DATABASE_URL: str = "postgresql://localhost:5432/retail_demand"
-    
-    # Redis (for Celery)
-    REDIS_URL: str = "redis://localhost:6379/0"
-    
-    # Forecasting defaults
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
+
+    APP_NAME: str = "InventAI"
+    APP_VERSION: str = "1.0.0"
+    APP_ENV: str = "development"
+    API_PREFIX: str = "/api/v1"
+    FRONTEND_URL: str = "http://localhost:5173"
+    ALLOWED_ORIGINS_RAW: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173,https://your-vercel-app.vercel.app",
+        alias="ALLOWED_ORIGINS",
+    )
+
+    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/inventai"
+
+    JWT_SECRET_KEY: str = "change-me-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+    ADMIN_INIT_TOKEN: str = "inventai-admin-token"
+    ENCRYPTION_KEY: str = "change-me-change-me-change-me-change!!"
+
     DEFAULT_FORECAST_HORIZON: int = 7
     MIN_DATA_DAYS_ARIMA: int = 60
     MIN_DATA_DAYS_MOVING_AVG: int = 30
     SAFETY_STOCK_MULTIPLIER: float = 1.2
-    
-    # API
-    API_PREFIX: str = "/api"
-    
-    # External APIs
+    MAX_UPLOAD_FILE_SIZE_BYTES: int = 5 * 1024 * 1024
+
     OGD_INDIA_API_KEY: Optional[str] = None
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+
+    @computed_field
+    @property
+    def allowed_origins(self) -> List[str]:
+        origins = [origin.strip() for origin in self.ALLOWED_ORIGINS_RAW.split(",") if origin.strip()]
+        if self.FRONTEND_URL and self.FRONTEND_URL not in origins:
+            origins.append(self.FRONTEND_URL)
+        return origins
+
+    @model_validator(mode="after")
+    def validate_production_security(self):
+        if self.APP_ENV.lower() != "production":
+            return self
+
+        insecure_values = {
+            "JWT_SECRET_KEY": "change-me-in-production",
+            "ENCRYPTION_KEY": "change-me-change-me-change-me-change!!",
+            "ADMIN_INIT_TOKEN": "inventai-admin-token",
+        }
+        for field_name, insecure_value in insecure_values.items():
+            if getattr(self, field_name) == insecure_value:
+                raise ValueError(f"{field_name} must be set from the environment in production.")
+
+        if "*" in self.allowed_origins:
+            raise ValueError("ALLOWED_ORIGINS cannot include '*' in production.")
+
+        return self
 
 
-settings = Settings()
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

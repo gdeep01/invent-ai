@@ -1,312 +1,221 @@
-import pandas as pd
-from datetime import date, timedelta
+import logging
+from collections import defaultdict
+from datetime import date
 from typing import List, Optional
+
+import pandas as pd
 from sqlalchemy.orm import Session
 
-from app.models import Store, SKU, SalesTransaction, ForecastResult, ForecastModel
-from app.services.forecasting.baseline import BaselineForecaster, ForecastPoint, calculate_velocity_change
+from app.models import (
+    Alert,
+    FestivalMultiplier,
+    ForecastResult,
+    ForecastRun,
+    SKU,
+    SalesTransaction,
+    Store,
+    UserSettings,
+)
+from app.services.festivals import FestivalService
+from app.services.forecasting.baseline import BaselineForecaster, calculate_velocity_change
 from app.services.forecasting.arima import ARIMAForecaster
 
+logger = logging.getLogger("inventai.forecast")
 
-import concurrent.futures
-import os
-
-# Persistent process pool for CPU-bound forecasting tasks
-# Initialized on first use to avoid overhead if not used
-_forecast_pool = None
-
-def get_forecast_pool():
-    global _forecast_pool
-    if _forecast_pool is None:
-        # Limit to 2-4 workers for local Kirana app to avoid memory pressure
-        max_workers = min(os.cpu_count() or 1, 4)
-        print(f"Initializing persistent forecast pool with {max_workers} workers...")
-        _forecast_pool = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
-    return _forecast_pool
 
 class ForecasterService:
-    """
-    Main forecasting service.
-    
-    Model selection logic per SKU:
-    - <30 days: Moving average
-    - ≥60 days: ARIMA
-    """
-    
     def __init__(self, db: Session):
         self.db = db
-    
+
     def forecast_store(
         self,
+        user_id: int,
         store_id: str,
         horizon: int = 7,
-        sku_ids: Optional[List[str]] = None
+        sku_ids: Optional[List[str]] = None,
+        model: str = "arima",
     ) -> dict:
-        """
-        Generate forecasts for all SKUs in a store PARALLELIZED.
-        """
-        # 1. Get Store
-        store = self.db.query(Store).filter(Store.store_id == store_id).first()
+        store = self.db.query(Store).filter(Store.user_id == user_id, Store.store_id == store_id).first()
         if not store:
             return {}
-        
-        # 2. Bulk Fetch Data (One Query)
-        sku_query = self.db.query(SKU).filter(SKU.store_id == store.id)
+
+        sku_query = self.db.query(SKU).filter(SKU.user_id == user_id, SKU.store_id == store.id)
         if sku_ids:
             sku_query = sku_query.filter(SKU.sku_id.in_(sku_ids))
         skus = sku_query.all()
-        sku_map = {s.id: s for s in skus} 
-        
-        if not skus:
+        sku_map = {sku.id: sku for sku in skus}
+        if not sku_map:
             return {}
-            
-        relevant_sku_ids = list(sku_map.keys())
-        
-        # Optimization: Filter by relevant SKUs and get only needed columns
-        transactions = self.db.query(SalesTransaction.sku_id, SalesTransaction.date, SalesTransaction.units_sold).filter(
-            SalesTransaction.store_id == store.id,
-            SalesTransaction.sku_id.in_(relevant_sku_ids)
-        ).order_by(SalesTransaction.date).all()
-        
-        # Group data by SKU in memory (Faster than multiple queries)
-        from collections import defaultdict
+
+        transactions = (
+            self.db.query(SalesTransaction)
+            .filter(
+                SalesTransaction.user_id == user_id,
+                SalesTransaction.store_id == store.id,
+                SalesTransaction.sku_id.in_(list(sku_map.keys())),
+                SalesTransaction.excluded_from_forecast.is_(False),
+            )
+            .order_by(SalesTransaction.date)
+            .all()
+        )
+
+        festival_service = FestivalService(self.db)
+        upcoming_festivals = festival_service.get_upcoming_festivals(date.today(), horizon)
+        multiplier_lookup = self._category_multiplier_lookup(user_id)
+
         data_by_sku = defaultdict(list)
-        for t in transactions:
-            data_by_sku[t.sku_id].append({
-                'date': t.date,
-                'units_sold': t.units_sold
-            })
-            
-        # 3. Prepare Tasks
-        tasks = []
-        for sku_db_id, sku_obj in sku_map.items():
-            records = data_by_sku.get(sku_db_id, [])
-            if records:
-                tasks.append((sku_obj.sku_id, sku_obj.sku_name, records, horizon))
+        for transaction in transactions:
+            data_by_sku[transaction.sku_id].append({"date": transaction.date, "units_sold": transaction.units_sold})
 
-        # 4. Run Parallel (Persistent Pool)
         results = {}
-        
-        if not tasks:
-            return {}
+        for sku_db_id, sku in sku_map.items():
+            records = data_by_sku.get(sku_db_id, [])
+            if not records:
+                continue
+            frame = pd.DataFrame(records)
+            forecast_points, model_used = self._forecast_points_for_model(frame, horizon, model)
+            velocity_change = calculate_velocity_change(frame)
+            festival_boost_applied = False
+            multiplier = multiplier_lookup.get((sku.category or "").lower(), 1.0)
+            if upcoming_festivals and multiplier > 1.0:
+                festival_boost_applied = True
+                for point in forecast_points:
+                    point.predicted_units = round(point.predicted_units * multiplier, 2)
+                    if point.confidence_lower is not None:
+                        point.confidence_lower = round(point.confidence_lower * multiplier, 2)
+                    if point.confidence_upper is not None:
+                        point.confidence_upper = round(point.confidence_upper * multiplier, 2)
 
-        pool = get_forecast_pool()
-        
-        try:
-            # Submit all tasks to the persistent pool
-            futures = [pool.submit(_worker_forecast_sku, *task) for task in tasks]
-            
-            # Wait for completion with a timeout to avoid hanging
-            for future in concurrent.futures.as_completed(futures, timeout=30):
-                try:
-                    res = future.result()
-                    if res:
-                        results[res['sku_id']] = {
-                            'sku_name': res['sku_name'],
-                            'forecasts': res['forecasts'],
-                            'model_used': res['model_used'],
-                            'velocity_change': res.get('velocity_change', 0.0)
-                        }
-                except Exception as e:
-                    print(f"Forecast worker failed: {e}")
-                    continue
-        except Exception as e:
-            print(f"Persistent pool execution failed ({e}), falling back to serial...")
-            # Fallback to serial for robustness
-            for task in tasks:
-                try:
-                    res = _worker_forecast_sku(*task)
-                    if res:
-                        results[res['sku_id']] = {
-                            'sku_name': res['sku_name'],
-                            'forecasts': res['forecasts'],
-                            'model_used': res['model_used'],
-                            'velocity_change': res.get('velocity_change', 0.0)
-                        }
-                except Exception as inner_e:
-                    print(f"Serial forecast failed for {task[1]}: {inner_e}")
+            results[sku.sku_id] = {
+                "sku_name": sku.sku_name,
+                "forecasts": forecast_points,
+                "model_used": model_used,
+                "velocity_change": velocity_change,
+                "festival_boost_applied": festival_boost_applied,
+                "health_score": self._health_score(sku.current_stock, forecast_points, velocity_change),
+            }
 
         return results
 
-    def generate_insights(self, forecasts: dict) -> List[str]:
-        """
-        Generate natural language insights from forecast data.
-        Target audience: Non-technical store owners.
-        """
-        insights = []
-        
-        if not forecasts:
-            return ["Not enough data to generate insights yet."]
-            
-        total_predicted_volume = 0
-        velocity_up = 0
-        velocity_down = 0
-        top_product = None
-        max_demand = -1
-        
-        for sku_data in forecasts.values():
-            # Calc total volume
-            vol = sum(f.predicted_units for f in sku_data['forecasts'])
-            total_predicted_volume += vol
-            
-            # Track velocity
-            vc = sku_data.get('velocity_change', 0)
-            if vc > 10:
-                velocity_up += 1
-            elif vc < -10:
-                velocity_down += 1
-                
-            # Find top mover
-            if vol > max_demand:
-                max_demand = vol
-                top_product = sku_data['sku_name']
-        
-        # Insight 1: Overall Trend
-        insights.append(f"We predicted a total demand of {int(total_predicted_volume)} units across all products for the next period.")
-        
-        # Insight 2: Velocity
-        if velocity_up > velocity_down:
-            insights.append(f"Good news! {velocity_up} products are showing a strong upward sales trend.")
-        elif velocity_down > velocity_up:
-            insights.append(f"Heads up: {velocity_down} products are selling slower than usual. You might want to run a promotion.")
-            
-        # Insight 3: Top Mover
-        if top_product:
-            insights.append(f"Star Performer: '{top_product}' is expected to be your highest selling item.")
-            
-        return insights
-
-    def generate_insights_from_schema(self, forecasts: List['ForecastResultSchema']) -> List[str]:
-        """
-        Generate insights from ForecastResultSchema objects (for get_forecast endpoint).
-        """
-        if not forecasts:
-            return ["No forecast data available to generate insights."]
-            
-        # Group by SKU
-        from collections import defaultdict
-        sku_groups = defaultdict(list)
-        for r in forecasts:
-            sku_groups[r.sku_id].append(r)
-            
-        # Calculate stats
-        total_predicted_volume = sum(r.predicted_units for r in forecasts)
-        top_product = None
-        max_demand = -1
-        
-        for sku_id, items in sku_groups.items():
-            vol = sum(i.predicted_units for i in items)
-            if vol > max_demand:
-                 max_demand = vol
-                 # Get name from first item
-                 top_product = items[0].sku_name
-                 
-        # Generate text
-        insights = []
-        insights.append(f"Total predicted demand: {int(total_predicted_volume)} units.")
-        
-        if top_product:
-             insights.append(f"Star Performer: '{top_product}' is expected to be your highest selling item.")
-             
-        # Add a simple volatility/trend insight if possible
-        # e.g. check if last day > first day
-        return insights
-        
-    def save_forecasts(
-        self,
-        store_id: str,
-        forecasts: dict,
-        horizon: int
-    ) -> int:
-        """
-        Save forecast results to database.
-        
-        Returns:
-            Number of forecasts saved
-        """
-        store = self.db.query(Store).filter(Store.store_id == store_id).first()
+    def save_forecasts(self, user_id: int, store_id: str, forecasts: dict, horizon: int, forecast_run: ForecastRun | None = None) -> int:
+        store = self.db.query(Store).filter(Store.user_id == user_id, Store.store_id == store_id).first()
         if not store:
             return 0
-        
-        # Get all SKUs for lookups
-        skus = self.db.query(SKU).filter(SKU.store_id == store.id).all()
-        sku_map = {s.sku_id: s.id for s in skus}
-        
-        forecast_objects = []
-        
-        for sku_id_str, sku_data in forecasts.items():
-            if sku_id_str not in sku_map:
-                continue
-                
-            sku_db_id = sku_map[sku_id_str]
-            
-            # Get model type
-            model_str = sku_data.get('model_used', 'moving_average')
-            try:
-                model_type = ForecastModel[model_str.upper()]
-            except:
-                model_type = ForecastModel.MOVING_AVERAGE
-            
-            for forecast_point in sku_data['forecasts']:
-                forecast_objects.append(ForecastResult(
-                    store_id=store.id,
-                    sku_id=sku_db_id,
-                    forecast_date=forecast_point.date,
-                    predicted_units=forecast_point.predicted_units,
-                    confidence_lower=forecast_point.confidence_lower,
-                    confidence_upper=forecast_point.confidence_upper,
-                    model_used=model_type,
-                    forecast_horizon=horizon
-                ))
 
-        # Faster: Delete ALL forecasts for this Store + Horizon (simple)
-        forecasted_sku_db_ids = [sku_map[sid] for sid in forecasts.keys() if sid in sku_map]
-        
-        if forecasted_sku_db_ids:
-             self.db.query(ForecastResult).filter(
-                 ForecastResult.store_id == store.id,
-                 ForecastResult.sku_id.in_(forecasted_sku_db_ids),
-                 ForecastResult.forecast_date >= date.today()
-             ).delete(synchronize_session=False)
+        sku_lookup = {
+            sku.sku_id: sku
+            for sku in self.db.query(SKU).filter(SKU.user_id == user_id, SKU.store_id == store.id).all()
+        }
+
+        if sku_lookup:
+            self.db.query(ForecastResult).filter(
+                ForecastResult.user_id == user_id,
+                ForecastResult.store_id == store.id,
+                ForecastResult.sku_id.in_([sku.id for sku in sku_lookup.values()]),
+                ForecastResult.forecast_horizon == horizon,
+            ).delete(synchronize_session=False)
+
+        forecast_objects: List[ForecastResult] = []
+        for sku_id, data in forecasts.items():
+            sku = sku_lookup.get(sku_id)
+            if not sku:
+                continue
+            for point in data["forecasts"]:
+                confidence_upper = point.confidence_upper or point.predicted_units
+                confidence_lower = point.confidence_lower or point.predicted_units
+                spread = max(confidence_upper - confidence_lower, 0)
+                confidence = max(0.0, round(1 - (spread / max(point.predicted_units or 1, 1)), 2))
+                forecast_objects.append(
+                    ForecastResult(
+                        user_id=user_id,
+                        store_id=store.id,
+                        sku_id=sku.id,
+                        forecast_run_id=forecast_run.id if forecast_run else None,
+                        forecast_date=point.date,
+                        predicted_units=point.predicted_units,
+                        confidence_lower=point.confidence_lower,
+                        confidence_upper=point.confidence_upper,
+                        model_used=data["model_used"],
+                        forecast_horizon=horizon,
+                        health_score=data.get("health_score"),
+                        forecast_confidence=confidence,
+                        festival_boost_applied=data.get("festival_boost_applied", False),
+                    )
+                )
 
         if forecast_objects:
             self.db.bulk_save_objects(forecast_objects)
             self.db.commit()
-            
         return len(forecast_objects)
 
+    def generate_alerts(self, user_id: int, store_id: str, recommendations, mandi_prices: list[dict]) -> int:
+        store = self.db.query(Store).filter(Store.user_id == user_id, Store.store_id == store_id).first()
+        if not store:
+            return 0
 
-# --- WORKER FUNCTIONS (Must be at module level for ProcessPoolExecutor) ---
+        self.db.query(Alert).filter(Alert.user_id == user_id, Alert.store_id == store.id).delete(synchronize_session=False)
+        mandi_price_lookup = {item.get("commodity", "").lower(): item for item in mandi_prices}
+        created = 0
+        for recommendation in recommendations:
+            price_data = mandi_price_lookup.get(recommendation.sku_name.lower()) or {}
+            price = price_data.get("modal_price", "N/A")
+            message = (
+                f"{recommendation.sku_name} stock is running low. "
+                f"Reorder {recommendation.reorder_qty} units now. "
+                f"Mandi price: Rs. {price}."
+            )
+            self.db.add(
+                Alert(
+                    user_id=user_id,
+                    store_id=store.id,
+                    message=message,
+                    severity=recommendation.urgency,
+                )
+            )
+            created += 1
+        self.db.commit()
+        return created
 
-def _worker_forecast_sku(sku_id, sku_name, records, horizon):
-    """
-    Worker task to forecast a single SKU.
-    Runs in a separate process for CPU parallelism.
-    """
-    try:
-        if not records:
-            return None
-            
-        # Convert records to DataFrame
-        df = pd.DataFrame(records)
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # 1. Calculate Velocity Change (for insights)
-        velocity_change = calculate_velocity_change(df)
-        
-        # 2. Run Forecast
-        # ARIMAForecaster automatically selects best model based on data length
-        forecaster = ARIMAForecaster(df)
-        forecasts = forecaster.forecast(horizon)
-        model_used = forecaster.get_model_used()
-        
-        return {
-            'sku_id': sku_id,
-            'sku_name': sku_name,
-            'forecasts': forecasts,
-            'model_used': model_used,
-            'velocity_change': velocity_change
-        }
-    except Exception as e:
-        print(f"Error in _worker_forecast_sku for {sku_name}: {e}")
-        return None
+    def generate_insights_from_results(self, results: list[ForecastResult]) -> list[str]:
+        if not results:
+            return ["No forecast data available yet."]
+        total = sum(result.predicted_units for result in results)
+        boosted = sum(1 for result in results if result.festival_boost_applied)
+        return [
+            f"Projected demand totals {int(total)} units for the selected horizon.",
+            f"Festival boost applied to {boosted} forecast points." if boosted else "No festival demand boost was applied.",
+        ]
+
+    def calculate_mae(self, transactions: list[SalesTransaction], forecasts: dict) -> float:
+        actuals = {(transaction.sku_id, transaction.date): transaction.units_sold for transaction in transactions}
+        errors = []
+        for _, data in forecasts.items():
+            for point in data["forecasts"]:
+                for actual in actuals.values():
+                    errors.append(abs(point.predicted_units - actual))
+                    break
+        return round(sum(errors) / len(errors), 2) if errors else 0.0
+
+    def _forecast_points_for_model(self, frame: pd.DataFrame, horizon: int, model: str) -> tuple[list, str]:
+        normalized_model = (model or "arima").lower()
+        if normalized_model == "baseline":
+            forecaster = BaselineForecaster(frame)
+            return forecaster.moving_average_forecast(horizon), "baseline"
+
+        forecaster = ARIMAForecaster(frame)
+        return forecaster.forecast(horizon), forecaster.get_model_used()
+
+    def _category_multiplier_lookup(self, user_id: int) -> dict[str, float]:
+        settings_row = self.db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+        if not settings_row:
+            return {}
+        rows = self.db.query(FestivalMultiplier).filter(FestivalMultiplier.settings_id == settings_row.id).all()
+        return {(row.category or "").lower(): row.multiplier for row in rows}
+
+    def _health_score(self, current_stock: int, forecast_points, velocity_change: float) -> float:
+        avg_demand = sum(point.predicted_units for point in forecast_points) / max(len(forecast_points), 1)
+        days_of_stock = current_stock / avg_demand if avg_demand else 30
+        stock_component = min(days_of_stock / 14, 1) * 40
+        confidence_component = 35
+        trend_component = max(0, 25 - min(abs(velocity_change), 25))
+        return round(stock_component + confidence_component + trend_component, 1)

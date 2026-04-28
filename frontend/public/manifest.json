@@ -1,0 +1,16 @@
+{
+  "name": "InventAI",
+  "short_name": "InventAI",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#130c07",
+  "theme_color": "#f97316",
+  "icons": [
+    {
+      "src": "/vite.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,34 +1,34 @@
 services:
-  backend:
+  inventai-backend:
     build: ./backend
     ports:
       - "8002:8002"
     environment:
-      - DATABASE_URL=sqlite:///./retail_demand.db
-      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/inventai
+      - ALLOWED_ORIGINS=http://localhost:5173
+      - FRONTEND_URL=http://localhost:5173
     depends_on:
-      - redis
+      - postgres
 
-  frontend:
+  inventai-frontend:
     build: ./frontend
     ports:
       - "5173:5173"
     environment:
-      - VITE_API_BASE=${VITE_API_BASE:-http://localhost:8002/api}
+      - VITE_API_BASE=${VITE_API_BASE:-http://localhost:8002/api/v1}
     depends_on:
-      - backend
+      - inventai-backend
 
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-
-  worker:
-    build: ./backend
-    command: celery -A app.worker.celery_app worker --loglevel=info
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - DATABASE_URL=sqlite:///./retail_demand.db
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      - redis
-      - backend
+      - POSTGRES_DB=inventai
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

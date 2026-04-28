@@ -1,172 +1,163 @@
-/**
- * Settings Page - Festival Configuration & Store Settings
- */
+import { useEffect, useMemo, useState } from 'react';
+import { KeyRound, PartyPopper, Save } from 'lucide-react';
+import { toast } from 'sonner';
 
-import { useState, useEffect } from 'react';
-
-import {
-    Settings,
-    PartyPopper,
-    Calendar,
-    PlusCircle,
-    CheckCircle2,
-    AlertCircle
-} from 'lucide-react';
 import api from '../services/api';
+import SortableHeader from '../components/ui/sortable-header';
 
-// Terminology standardized for enterprise use
+function compareValues(left, right, direction) {
+  const normalizedLeft = left ?? '';
+  const normalizedRight = right ?? '';
+
+  if (typeof normalizedLeft === 'number' && typeof normalizedRight === 'number') {
+    return direction === 'asc' ? normalizedLeft - normalizedRight : normalizedRight - normalizedLeft;
+  }
+
+  return direction === 'asc'
+    ? String(normalizedLeft).localeCompare(String(normalizedRight))
+    : String(normalizedRight).localeCompare(String(normalizedLeft));
+}
 
 export default function SettingsPage() {
-    const [festivals, setFestivals] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [seeding, setSeeding] = useState(false);
-    const [message, setMessage] = useState(null);
+  const [settings, setSettings] = useState({ gemini_api_key: '', notification_threshold_days: 7, festival_multipliers: [] });
+  const [festivals, setFestivals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [multiplierSort, setMultiplierSort] = useState({ key: 'category', direction: 'asc' });
+  const [festivalSort, setFestivalSort] = useState({ key: 'date', direction: 'asc' });
 
-    useEffect(() => {
-        loadFestivals();
-    }, []);
+  useEffect(() => {
+    Promise.all([api.getSettings(), api.getFestivals()]).then(([settingsResponse, festivalRows]) => {
+      setSettings({
+        gemini_api_key: '',
+        notification_threshold_days: settingsResponse.notification_threshold_days,
+        festival_multipliers: settingsResponse.festival_multipliers.length ? settingsResponse.festival_multipliers : [
+          { category: 'sweets', multiplier: 1.4 },
+          { category: 'oil', multiplier: 1.25 },
+        ],
+      });
+      setFestivals(festivalRows);
+    }).catch((error) => toast.error(error.message)).finally(() => setLoading(false));
+  }, []);
 
-    const loadFestivals = async () => {
-        setLoading(true);
-        try {
-            const data = await api.getFestivals();
-            setFestivals(data);
-        } catch (err) {
-            console.error('Failed to load festivals:', err);
-        } finally {
-            setLoading(false);
-        }
-    };
+  const updateMultiplier = (index, key, value) => {
+    setSettings((current) => {
+      const next = [...current.festival_multipliers];
+      next[index] = { ...next[index], [key]: key === 'multiplier' ? Number(value) : value };
+      return { ...current, festival_multipliers: next };
+    });
+  };
 
-    const seedFestivals = async () => {
-        setSeeding(true);
-        setMessage(null);
-        try {
-            const data = await api.seedFestivals(2026);
-            if (data.success) {
-                setMessage({ type: 'success', text: `Added ${data.festivals_added} festivals for ${data.year}` });
-                loadFestivals();
-            }
-        } catch (err) {
-            setMessage({ type: 'error', text: 'Failed to synchronize festival configuration' });
-        } finally {
-            setSeeding(false);
-        }
-    };
+  const saveSettings = async () => {
+    await api.updateSettings(settings);
+    toast.success('Settings saved');
+  };
 
-    return (
-        <div>
-            <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-xs)' }}>
-                    <Settings size={28} color="var(--color-primary)" />
-                    <h1 className="card-title" style={{ marginBottom: 0 }}>Settings</h1>
-                </div>
-                <p className="card-subtitle">Configure festivals and seasonality for better predictions</p>
-            </div>
+  const seedFestivals = async () => {
+    await api.seedFestivals(new Date().getFullYear());
+    const rows = await api.getFestivals();
+    setFestivals(rows);
+    toast.success('Festival calendar seeded');
+  };
 
-            {/* Message */}
-            {message && (
-                <div className={`alert alert-${message.type}`} style={{ marginBottom: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    {message.type === 'success' ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
-                    {message.text}
-                </div>
-            )}
+  const sortedMultipliers = useMemo(() => {
+    return settings.festival_multipliers
+      .map((row, index) => ({ row, originalIndex: index }))
+      .sort((a, b) => compareValues(a.row[multiplierSort.key], b.row[multiplierSort.key], multiplierSort.direction));
+  }, [settings.festival_multipliers, multiplierSort]);
 
-            {/* Festival Configuration */}
-            <div className="card">
-                <div className="card-header">
-                    <div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', marginBottom: 'var(--space-xs)' }}>
-                            <PartyPopper size={24} color="var(--color-primary)" />
-                            <h2 className="card-title" style={{ marginBottom: 0 }}>Festival Calendar</h2>
-                        </div>
-                        <p className="card-subtitle">
-                            Festivals increase demand. Configure them for better forecasts.
-                        </p>
-                    </div>
-                    <button
-                        className="btn btn-primary"
-                        onClick={seedFestivals}
-                        disabled={seeding}
-                        style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
-                    >
-                        {seeding ? (
-                            <>
-                                <div className="spinner" style={{ width: '16px', height: '16px', borderWidth: '2px' }}></div>
-                                Adding...
-                            </>
-                        ) : (
-                            <>
-                                <PlusCircle size={16} />
-                                Synchronize Regional Festivals
-                            </>
-                        )}
-                    </button>
-                </div>
+  const sortedFestivals = useMemo(() => {
+    return [...festivals].sort((a, b) => compareValues(a[festivalSort.key], b[festivalSort.key], festivalSort.direction));
+  }, [festivals, festivalSort]);
 
-                {loading ? (
-                    <div className="loading">
-                        <div className="spinner"></div>
-                    </div>
-                ) : festivals.length === 0 ? (
-                    <div className="empty-state">
-                        <div className="empty-state-icon">
-                            <Calendar size={48} />
-                        </div>
-                        <h3>No Festivals Configured</h3>
-                        <p>Click "Add India Festivals" to add Diwali, Holi, Eid, and more.</p>
-                    </div>
-                ) : (
-                    <div className="table-container">
-                        <table className="table">
-                            <thead>
-                                <tr>
-                                    <th>Festival</th>
-                                    <th>Date</th>
-                                    <th>Region</th>
-                                    <th>Demand Impact</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {festivals.map((fest, idx) => (
-                                    <tr key={idx}>
-                                        <td><strong>{fest.name}</strong></td>
-                                        <td>{fest.date}</td>
-                                        <td>
-                                            <span className="badge badge-low">{fest.region || 'All India'}</span>
-                                        </td>
-                                        <td>
-                                            <span style={{
-                                                color: fest.impact_multiplier >= 2 ? 'var(--color-danger)' :
-                                                    fest.impact_multiplier >= 1.5 ? 'var(--color-warning)' :
-                                                        'var(--color-success)'
-                                            }}>
-                                                {fest.impact_multiplier.toFixed(1)}x demand
-                                            </span>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                )}
-            </div>
+  const handleSortChange = (setter) => (column) => {
+    setter((current) => ({
+      key: column,
+      direction: current.key === column && current.direction === 'asc' ? 'desc' : 'asc',
+    }));
+  };
 
-            {/* How it works */}
-            <div className="card" style={{ marginTop: 'var(--space-lg)' }}>
-                <h3 className="card-title">How Festival Impact Works</h3>
-                <div style={{ color: 'var(--text-secondary)', marginTop: 'var(--space-md)' }}>
-                    <p>During festival periods, we adjust demand forecasts:</p>
-                    <ul style={{ marginTop: 'var(--space-sm)', paddingLeft: '1.5rem' }}>
-                        <li><strong>2.5x</strong> - Diwali (highest demand)</li>
-                        <li><strong>2.0x</strong> - Eid, Durga Puja</li>
-                        <li><strong>1.5-1.8x</strong> - Other major festivals</li>
-                    </ul>
-                    <p style={{ marginTop: 'var(--space-md)' }}>
-                        The impact extends 2 days before and after the festival date.
-                    </p>
-                </div>
-            </div>
+  if (loading) {
+    return <div className="skeleton-card" style={{ minHeight: '20rem' }} />;
+  }
+
+  return (
+    <div>
+      <div className="card">
+        <div className="card-header">
+          <div>
+            <h1 className="card-title">Settings</h1>
+            <p className="card-subtitle">Configure Gemini access, festival multipliers, and notification thresholds.</p>
+          </div>
+          <button className="btn btn-primary" onClick={saveSettings}><Save size={16} />Save</button>
         </div>
-    );
+        <div className="form-group">
+          <label className="form-label"><KeyRound size={16} style={{ marginRight: '0.5rem' }} />Gemini API key</label>
+          <input className="form-input" type="password" placeholder="Paste your Gemini API key" value={settings.gemini_api_key} onChange={(e) => setSettings((current) => ({ ...current, gemini_api_key: e.target.value }))} />
+        </div>
+        <div className="form-group">
+          <label className="form-label">Notification threshold in days</label>
+          <input className="form-input" type="number" min="1" max="60" value={settings.notification_threshold_days} onChange={(e) => setSettings((current) => ({ ...current, notification_threshold_days: Number(e.target.value) }))} />
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: '1.5rem' }}>
+        <div className="card-header">
+          <div>
+            <h2 className="card-title">Festival multipliers</h2>
+            <p className="card-subtitle">These multipliers influence the forecast-side festival boost logic.</p>
+          </div>
+        </div>
+        <div className="table-container">
+          <table className="table">
+            <thead>
+              <tr>
+                <SortableHeader label="Category" column="category" sortConfig={multiplierSort} onSort={handleSortChange(setMultiplierSort)} />
+                <SortableHeader label="Multiplier" column="multiplier" sortConfig={multiplierSort} onSort={handleSortChange(setMultiplierSort)} />
+              </tr>
+            </thead>
+            <tbody>
+              {sortedMultipliers.map(({ row, originalIndex }) => (
+                <tr key={`${row.category}-${originalIndex}`}>
+                  <td><input className="form-input" value={row.category} onChange={(e) => updateMultiplier(originalIndex, 'category', e.target.value)} /></td>
+                  <td><input className="form-input" type="number" step="0.05" min="0.1" max="5" value={row.multiplier} onChange={(e) => updateMultiplier(originalIndex, 'multiplier', e.target.value)} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: '1.5rem' }}>
+        <div className="card-header">
+          <div>
+            <h2 className="card-title"><PartyPopper size={18} style={{ marginRight: '0.5rem' }} />Festival calendar</h2>
+            <p className="card-subtitle">Upcoming festivals used by the demand boost service.</p>
+          </div>
+          <button className="btn btn-ghost" onClick={seedFestivals}>Seed festivals</button>
+        </div>
+        <div className="table-container">
+          <table className="table">
+            <thead>
+              <tr>
+                <SortableHeader label="Name" column="name" sortConfig={festivalSort} onSort={handleSortChange(setFestivalSort)} />
+                <SortableHeader label="Date" column="date" sortConfig={festivalSort} onSort={handleSortChange(setFestivalSort)} />
+                <SortableHeader label="Region" column="region" sortConfig={festivalSort} onSort={handleSortChange(setFestivalSort)} />
+                <SortableHeader label="Impact" column="impact_multiplier" sortConfig={festivalSort} onSort={handleSortChange(setFestivalSort)} />
+              </tr>
+            </thead>
+            <tbody>
+              {sortedFestivals.map((festival) => (
+                <tr key={`${festival.name}-${festival.date}`}>
+                  <td>{festival.name}</td>
+                  <td>{festival.date}</td>
+                  <td>{festival.region || 'All India'}</td>
+                  <td>{festival.impact_multiplier}x</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
 }

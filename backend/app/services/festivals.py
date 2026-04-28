@@ -1,12 +1,6 @@
-"""
-Festival and Seasonality Service.
-
-India-specific festival configuration for demand forecasting.
-Do NOT hardcode festivals - use the database config table.
-"""
-
 from datetime import date, timedelta
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
 from sqlalchemy.orm import Session
 
 from app.models import Festival
@@ -49,121 +43,84 @@ DEFAULT_FESTIVALS = [
 
 
 class FestivalService:
-    """Service for managing festival configurations."""
-    
     def __init__(self, db: Session):
         self.db = db
-    
+
     def seed_default_festivals(self, year: int = 2026) -> int:
-        """
-        Seed the database with default festival dates for a given year.
-        Returns number of festivals added.
-        """
         count = 0
         for fest in DEFAULT_FESTIVALS:
             try:
                 festival_date = date(year, fest["month"], fest["day"])
-                
-                # Check if already exists
+
                 existing = self.db.query(Festival).filter(
                     Festival.name == fest["name"],
                     Festival.date == festival_date
                 ).first()
-                
                 if not existing:
                     festival = Festival(
                         name=fest["name"],
                         date=festival_date,
                         region=fest["region"],
-                        impact_multiplier=fest["impact_multiplier"]
+                        impact_multiplier=fest["impact_multiplier"],
                     )
                     self.db.add(festival)
                     count += 1
             except ValueError:
-                # Invalid date, skip
                 continue
-        
+
         self.db.commit()
         return count
-    
-    def get_festivals_in_range(
-        self, 
-        start_date: date, 
-        end_date: date,
-        region: Optional[str] = None
-    ) -> List[Festival]:
-        """Get all festivals within a date range."""
+
+    def get_festivals_in_range(self, start_date: date, end_date: date, region: Optional[str] = None) -> List[Festival]:
         query = self.db.query(Festival).filter(
             Festival.date >= start_date,
             Festival.date <= end_date
         )
-        
         if region:
-            query = query.filter(
-                (Festival.region == region) | (Festival.region == "All India")
-            )
-        
+            query = query.filter((Festival.region == region) | (Festival.region == "All India"))
         return query.order_by(Festival.date).all()
-    
-    def get_festival_dates_dict(
-        self, 
-        start_date: date, 
-        end_date: date
-    ) -> Dict[date, str]:
-        """
-        Get a dict mapping dates to festival names.
-        Used for feature engineering.
-        """
+
+    def get_festival_dates_dict(self, start_date: date, end_date: date) -> Dict[date, str]:
         festivals = self.get_festivals_in_range(start_date, end_date)
-        
         result = {}
         for fest in festivals:
-            # Include days around the festival (festival effect)
-            for delta in range(-2, 3):  # 2 days before to 2 days after
+            for delta in range(-2, 3):
                 fest_date = fest.date + timedelta(days=delta)
                 if start_date <= fest_date <= end_date:
                     if fest_date not in result:
                         result[fest_date] = fest.name
-        
         return result
-    
+
     def get_impact_multiplier(self, target_date: date) -> float:
-        """
-        Get demand impact multiplier for a specific date.
-        Returns 1.0 if no festival, higher if festival nearby.
-        """
-        # Check 2 days before and after
         for delta in range(-2, 3):
             check_date = target_date + timedelta(days=-delta)
-            festival = self.db.query(Festival).filter(
-                Festival.date == check_date
-            ).first()
-            
+            festival = self.db.query(Festival).filter(Festival.date == check_date).first()
             if festival:
-                # Reduce impact for days before/after
                 distance_factor = 1.0 - (abs(delta) * 0.2)
                 return festival.impact_multiplier * distance_factor
-        
         return 1.0
-    
+
+    def get_upcoming_festivals(self, start_date: date, days: int = 30) -> List[Festival]:
+        return self.get_festivals_in_range(start_date, start_date + timedelta(days=days))
+
     def add_festival(
         self,
         name: str,
         festival_date: date,
         region: Optional[str] = "All India",
-        impact_multiplier: float = 1.5
+        impact_multiplier: float = 1.5,
+        category: Optional[str] = None,
     ) -> Festival:
-        """Add a new festival to the configuration."""
         festival = Festival(
             name=name,
             date=festival_date,
             region=region,
-            impact_multiplier=impact_multiplier
+            impact_multiplier=impact_multiplier,
+            category=category,
         )
         self.db.add(festival)
         self.db.commit()
         return festival
-    
+
     def get_all_festivals(self) -> List[Festival]:
-        """Get all configured festivals."""
         return self.db.query(Festival).order_by(Festival.date).all()

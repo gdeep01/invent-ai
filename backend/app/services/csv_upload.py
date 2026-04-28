@@ -1,586 +1,417 @@
-import pandas as pd
+import re
 from io import StringIO
-from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 from sqlalchemy.orm import Session
 
-from app.models import Store, SKU, SalesTransaction
-from app.schemas import SalesRowSchema, CSVUploadResponse
+from app.config.settings import settings
+from app.core.security import decrypt_value
+from app.models import SKU, SalesTransaction, Store, User, UserSettings
+from app.schemas import CSVMappingSuggestion, CSVPreviewResponse, CSVUploadResponse, SalesRowSchema, UploadAnomaly
 
-
-# Column alias mapping for ingestion
 COLUMN_ALIASES: Dict[str, List[str]] = {
-    'store_id': [
-        'store_id', 'storeid', 'store', 'store_code', 'storecode', 
-        'shop_id', 'shopid', 'shop', 'outlet_id', 'outletid', 'outlet',
-        'branch_id', 'branchid', 'branch', 'location_id', 'locationid'
+    "store_id": [
+        "store_id", "store", "storecode", "shop_id", "branch_id", "branch",
+        "location", "city", "outlet", "outlet_id", "shop", "site", "site_id",
+        "store_name", "region", "area",
     ],
-    'sku_id': [
-        'sku_id', 'skuid', 'sku', 'sku_code', 'skucode',
-        'product_id', 'productid', 'product_code', 'productcode',
-        'item_id', 'itemid', 'item_code', 'itemcode',
-        'barcode', 'upc', 'ean', 'article_id', 'articleid'
+    "sku_id": [
+        "sku_id", "sku", "product_id", "item_id", "barcode", "invoice_id",
+        "invoice", "transaction_id", "order_id", "receipt_id", "bill_no",
+        "product_code", "item_code", "code", "id", "pid",
     ],
-    'sku_name': [
-        'sku_name', 'skuname', 'sku_description',
-        'product_name', 'productname', 'product', 'product_description',
-        'item_name', 'itemname', 'item', 'item_description',
-        'name', 'description', 'article_name', 'articlename'
+    "sku_name": [
+        "sku_name", "product_name", "item_name", "name", "description",
+        "product_description", "item_description", "title", "product_title",
+        "item_title", "goods_name", "article_name", "label",
     ],
-    'date': [
-        'date', 'sale_date', 'saledate', 'sales_date', 'salesdate',
-        'transaction_date', 'transactiondate', 'trans_date', 'transdate',
-        'order_date', 'orderdate', 'bill_date', 'billdate',
-        'invoice_date', 'invoicedate', 'dt', 'created_at', 'createdat'
+    "date": [
+        "date", "sale_date", "transaction_date", "invoice_date", "order_date",
+        "purchase_date", "bill_date", "created_at", "created_date", "datetime",
+        "sold_date", "entry_date", "txn_date",
     ],
-    'units_sold': [
-        'units_sold', 'unitssold', 'units', 'unit_sold', 'unitsold',
-        'quantity', 'qty', 'quantity_sold', 'quantitysold', 'qty_sold', 'qtysold',
-        'sales_qty', 'salesqty', 'sale_qty', 'saleqty',
-        'count', 'sold', 'pcs', 'pieces', 'nos', 'number'
+    "units_sold": [
+        "units_sold", "units", "quantity", "qty", "sold", "sales_qty",
+        "amount_sold", "count", "no_of_units", "num_units", "pieces",
+        "pcs", "volume", "sales_volume", "qty_sold",
     ],
-    'price': [
-        'price', 'unit_price', 'unitprice', 'selling_price', 'sellingprice',
-        'rate', 'mrp', 'cost', 'amount', 'value'
+    "price": [
+        "price", "unit_price", "selling_price", "rate", "mrp", "sp",
+        "sale_price", "retail_price", "cost", "amount", "value",
+        "gross_sales", "revenue", "sales_amount", "total_amount",
     ],
-    'discount': [
-        'discount', 'disc', 'discount_pct', 'discountpct', 'discount_percent',
-        'disc_pct', 'offer', 'rebate'
+    "discount": [
+        "discount", "discount_pct", "offer", "discount_amount",
+        "discount_percent", "rebate", "markdown", "tax_5", "tax",
     ],
-    'category': [
-        'category', 'cat', 'product_category', 'productcategory',
-        'item_category', 'itemcategory', 'type', 'product_type', 'producttype',
-        'group', 'product_group', 'productgroup', 'dept', 'department'
-    ]
+    "category": [
+        "category", "type", "product_category", "product_line", "product line",
+        "department", "section", "segment", "class", "sub_category",
+        "subcategory", "product_type", "item_type", "product_group",
+    ],
+}
+
+REQUIRED_COLUMNS = ["store_id", "sku_id", "date", "units_sold"]
+OPTIONAL_COLUMNS = ["sku_name", "price", "discount", "category"]
+DEFAULTABLE_COLUMNS = ["store_id", "sku_name"]
+COLUMN_EXPECTED_TYPES: Dict[str, str] = {
+    "date": "date",
+    "units_sold": "numeric",
+    "price": "numeric",
+    "discount": "numeric",
 }
 
 
+def sanitize_column_name(column_name: str) -> str:
+    sanitized = re.sub(r"[^a-zA-Z0-9_]+", "_", column_name.strip().lower())
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    return sanitized or "column"
+
+
+def normalize_headers(columns: List[str]) -> List[str]:
+    return [sanitize_column_name(column) for column in columns]
+
+
 def find_column_match(columns: List[str], target: str) -> Optional[str]:
-    """
-    Find a column that matches the target, checking aliases.
-    Returns the original column name if found, None otherwise.
-    """
-    aliases = COLUMN_ALIASES.get(target, [target])
-    columns_lower = {c.lower().strip().replace(' ', '_').replace('-', '_'): c for c in columns}
-    
-    for alias in aliases:
-        if alias in columns_lower:
-            return columns_lower[alias]
-    
+    normalized_map = {sanitize_column_name(column): column for column in columns}
+    for alias in COLUMN_ALIASES.get(target, [target]):
+        sanitized_alias = sanitize_column_name(alias)
+        if sanitized_alias in normalized_map:
+            return normalized_map[sanitized_alias]
     return None
 
 
-def map_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], List[str]]:
-    """
-    Smart column mapping - automatically detects and renames columns.
-    1. Tries header-based mapping first (smart aliases).
-    2. If that fails, uses CONTENT-BASED INFERENCE to guess column types.
-    
-    Returns:
-        - DataFrame with standardized column names
-        - Dict showing which original columns mapped to which standard names
-        - List of missing required columns (if any)
-    """
-    original_columns = list(df.columns)
-    mapping = {}
-    
-    required = ['store_id', 'sku_id', 'sku_name', 'date', 'units_sold']
-    optional = ['price', 'discount', 'category']
-    
-    # 1. Header-Based Mapping
-    for target in required + optional:
-        original_col = find_column_match(original_columns, target)
-        if original_col:
-            mapping[original_col] = target
-            
-    # Check what's missing
-    found_targets = set(mapping.values())
-    missing = [t for t in required if t not in found_targets]
-    
-    if not missing:
-        # All good with headers!
-        df = df.rename(columns=mapping)
-        return df, mapping, []
+def validate_mapped_column(df: pd.DataFrame, column_name: str, expected_type: str) -> bool:
+    if column_name not in df.columns:
+        return False
 
-    # 2. Content-Based Inference (Fallback)
-    # If we are missing critical columns, let's look at the data!
-    print(f"Header mapping failed for {missing}. Trying content inference...")
-    
-    # helper to check if col is mostly dates
-    def is_date_col(series):
-        try:
-            # Check a sample
-            sample = series.dropna().head(20)
-            if len(sample) == 0: return False
-            pd.to_datetime(sample, dayfirst=True)
-            return True
-        except:
+    sample = df[column_name].dropna().head(100)
+    if sample.empty:
+        return True
+
+    if expected_type == "date":
+        if pd.api.types.is_numeric_dtype(sample):
             return False
+        parsed = pd.to_datetime(sample, errors="coerce")
+        return bool(parsed.notna().all())
 
-    # helper to check if col is numeric
-    def is_numeric_col(series):
-        try:
-            # First try direct conversion
-            pd.to_numeric(series.dropna().head(20))
-            return True
-        except:
-            # Try cleaning "10 pcs" -> "10"
-            try:
-                sample = series.dropna().head(20).astype(str)
-                # Remove non-digits/dots
-                cleaned = sample.str.replace(r'[^\d.]', '', regex=True)
-                # If everything became empty, it was just text
-                if (cleaned == '').mean() > 0.5: return False
-                # Try converting cleaned
-                pd.to_numeric(cleaned)
-                return True
-            except:
-                return False
+    if expected_type == "numeric":
+        parsed = pd.to_numeric(sample, errors="coerce")
+        return bool(parsed.notna().all())
 
-    remaining_cols = [c for c in original_columns if c not in mapping]
-    
-    # A. Find Date (if missing)
-    if 'date' in missing:
-        for col in remaining_cols:
-            if is_date_col(df[col]):
-                mapping[col] = 'date'
-                remaining_cols.remove(col)
-                missing.remove('date')
-                break
-    
-    # B. Find Units Sold (Numeric, integers preferred)
-    if 'units_sold' in missing:
-        candidates = []
-        for col in remaining_cols:
-            if is_numeric_col(df[col]):
-                candidates.append(col)
-        
-        if candidates:
-            # If we have candidates, pick the best one.
-            # Heuristic: 'qty' integers often < price floats? 
-            # Or just pick the first numeric one if we have no clue.
-            # Ideally we'd look for integers.
-            mapping[candidates[0]] = 'units_sold'
-            remaining_cols.remove(candidates[0])
-            missing.remove('units_sold')
-            
-            # If 'price' is also missing and we have another numeric, take it
-            if 'price' not in found_targets and len(candidates) > 1:
-                mapping[candidates[1]] = 'price'
-                remaining_cols.remove(candidates[1])
+    return True
 
-    # C. Find Product Name/ID (String columns)
-    string_cols = [c for c in remaining_cols if df[c].dtype == 'object' or df[c].dtype == 'string']
-    
-    if 'sku_name' in missing and string_cols:
-        # Longest average string length -> likely Description/Name
-        best_col = max(string_cols, key=lambda c: df[c].astype(str).str.len().mean())
-        mapping[best_col] = 'sku_name'
-        remaining_cols.remove(best_col)
-        string_cols.remove(best_col)
-        missing.remove('sku_name')
 
-    if 'sku_id' in missing:
-        if string_cols:
-            # Next string col is ID
-            mapping[string_cols[0]] = 'sku_id'
-            # Don't remove from string_cols yet, might fallback
-        elif 'sku_name' in mapping.values():
-            # Fallback: Use Name as ID
-            print("Mapping: Using Name as ID")
-            pass # ID will be generated from name later logic
+def map_columns(df: pd.DataFrame, explicit_mapping: Optional[dict[str, str]] = None) -> Tuple[pd.DataFrame, Dict[str, str], List[str]]:
+    mapping: Dict[str, str] = {}
+    original_columns = list(df.columns)
+    already_used_sources: set = set()
 
-    if 'store_id' in missing:
-         # Default store will be created if missing
-         pass
+    if explicit_mapping:
+        for original, standard in explicit_mapping.items():
+            if original in original_columns:
+                mapping[original] = standard
+                already_used_sources.add(original)
 
-    # Rename what we found
+    for target in REQUIRED_COLUMNS + OPTIONAL_COLUMNS:
+        if target in mapping.values():
+            continue
+        original = find_column_match(original_columns, target)
+        if original and original not in already_used_sources:
+            mapping[original] = target
+            already_used_sources.add(original)
+
+    missing = [column for column in REQUIRED_COLUMNS if column not in DEFAULTABLE_COLUMNS and column not in mapping.values()]
     df = df.rename(columns=mapping)
-    
-    # 3. Final cleanup for still missing
-    # If ID is missing but Name exists, copy Name to ID
-    if 'sku_id' in missing and 'sku_name' in found_targets.union(mapping.values()):
-        df['sku_id'] = df['sku_name'] # Fallback
-        missing.remove('sku_id')
-    elif 'sku_id' in missing and 'sku_name' not in missing: # Name was just mapped
-        df['sku_id'] = df['sku_name']
-        missing.remove('sku_id')
-
-    # If Store is missing, we'll assign a default one later
-    if 'store_id' in missing:
-        missing.remove('store_id') # Accept it as valid, we'll handle in loop
-        
     return df, mapping, missing
 
 
+def validate_column_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> List[str]:
+    validation_errors: List[str] = []
+    for source_column, target_column in mapping.items():
+        expected_type = COLUMN_EXPECTED_TYPES.get(target_column)
+        if not expected_type:
+            continue
+        if not validate_mapped_column(df, source_column, expected_type):
+            validation_errors.append(
+                f"Column '{source_column}' matched to '{target_column}' but does not contain valid {expected_type} values."
+            )
+    return validation_errors
+
+
+def derive_sku_name(df: pd.DataFrame) -> pd.DataFrame:
+    if "sku_name" in df.columns:
+        return df
+    if "category" in df.columns and "sku_id" in df.columns:
+        df["sku_name"] = df["sku_id"].astype(str) + " - " + df["category"].astype(str)
+    elif "category" in df.columns:
+        df["sku_name"] = df["category"].astype(str)
+    elif "sku_id" in df.columns:
+        df["sku_name"] = df["sku_id"].astype(str)
+    else:
+        df["sku_name"] = "Unknown"
+    return df
+
+
+def candidate_gemini_models() -> List[str]:
+    candidates = [
+        settings.GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-preview-09-2025",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+    ]
+    deduped: List[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def detect_anomalies(df: pd.DataFrame) -> List[UploadAnomaly]:
+    anomalies: List[UploadAnomaly] = []
+    if {"sku_name", "date", "units_sold"} - set(df.columns):
+        return anomalies
+
+    working = df.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working["units_sold"] = pd.to_numeric(working["units_sold"], errors="coerce")
+    working = working.dropna(subset=["date", "units_sold"]).sort_values(["sku_name", "date"]).reset_index()
+
+    for sku_name, sku_df in working.groupby("sku_name"):
+        rolling_mean = sku_df["units_sold"].rolling(window=7, min_periods=3).mean()
+        rolling_std = sku_df["units_sold"].rolling(window=7, min_periods=3).std().fillna(0)
+        mask = sku_df["units_sold"] > (rolling_mean + (rolling_std * 2.5))
+        for _, row in sku_df[mask].iterrows():
+            anomalies.append(
+                UploadAnomaly(
+                    row_index=int(row["index"]),
+                    sku_name=sku_name,
+                    date=row["date"].date(),
+                    units_sold=float(row["units_sold"]),
+                    note=f"Unusual spike detected on {row['date'].date().isoformat()}",
+                )
+            )
+    return anomalies
+
+
+def validate_csv_columns(file_content: str) -> Tuple[bool, List[str], List[str]]:
+    try:
+        df = pd.read_csv(StringIO(file_content), nrows=3)
+        sanitized = normalize_headers(list(df.columns))
+        preview_df = df.copy()
+        preview_df.columns = sanitized
+        _, mapping, missing = map_columns(preview_df)
+        missing.extend(validate_column_mapping(preview_df, mapping))
+        return len(missing) == 0, sanitized, missing
+    except Exception:
+        return False, [], [column for column in REQUIRED_COLUMNS if column not in DEFAULTABLE_COLUMNS]
+
+
+def resolve_column_mapping(
+    df: pd.DataFrame, mapping: Optional[dict[str, str]] = None
+) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str]]:
+    mapped_df, discovered_mapping, missing = map_columns(df, mapping)
+    validation_errors = validate_column_mapping(df, discovered_mapping)
+    return mapped_df, discovered_mapping, missing, validation_errors
+
+
 class CSVUploadService:
-    """Service for handling CSV uploads and data ingestion."""
-    
-    REQUIRED_COLUMNS = ['store_id', 'sku_id', 'sku_name', 'date', 'units_sold']
-    OPTIONAL_COLUMNS = ['price', 'discount', 'category']
-    
     def __init__(self, db: Session):
         self.db = db
-    
-    def process_csv(self, file_content: str) -> CSVUploadResponse:
-        """
-        Process uploaded CSV file with SMART COLUMN MAPPING.
-        
-        Automatically detects common column name variations like:
-        - 'product_name' → 'sku_name'
-        - 'qty' or 'quantity' → 'units_sold'
-        - 'product_id' → 'sku_id'
-        """
+
+    def preview_csv(self, file_content: str, user: User, mapping: Optional[dict[str, str]] = None) -> CSVPreviewResponse:
+        df = pd.read_csv(StringIO(file_content))
+        df.columns = [sanitize_column_name(col) for col in df.columns]
+        mapped_df, discovered_mapping, missing, validation_errors = resolve_column_mapping(df, mapping)
+        used_ai = False
+        note = None
+        if missing or validation_errors:
+            ai_mapping = self._suggest_mapping_with_ai(user, df)
+            if ai_mapping:
+                mapped_df, discovered_mapping, missing, validation_errors = resolve_column_mapping(df, ai_mapping)
+                used_ai = True
+                note = "Gemini suggested the mapping for this CSV."
+        mapped_df = derive_sku_name(mapped_df)
+        missing = [col for col in missing if col != "sku_name"]
+        missing.extend(validation_errors)
+        anomalies = detect_anomalies(mapped_df if not missing else df)
+        return CSVPreviewResponse(
+            success=len(missing) == 0,
+            suggestion=CSVMappingSuggestion(mapping=discovered_mapping, missing_columns=missing, used_ai=used_ai, note=note),
+            sample_columns=list(df.columns),
+            anomalies=anomalies,
+        )
+
+    def process_csv(
+        self,
+        file_content: str,
+        user: User,
+        mapping: Optional[dict[str, str]] = None,
+        excluded_rows: Optional[List[int]] = None,
+    ) -> CSVUploadResponse:
+        excluded_rows = excluded_rows or []
         try:
-            # Parse CSV
             df = pd.read_csv(StringIO(file_content))
-            
-            # Automated Schema Normalization
-            df, column_mapping, missing_cols = map_columns(df)
-            
-            if missing_cols:
-                # Provide helpful error with suggestions
-                suggestions = []
-                for col in missing_cols:
-                    aliases = COLUMN_ALIASES.get(col, [])[:5]
-                    suggestions.append(f"'{col}' (we look for: {', '.join(aliases)})")
-                
+            df.columns = [sanitize_column_name(col) for col in df.columns]
+            df, _, missing, validation_errors = resolve_column_mapping(df, mapping)
+            if missing:
                 return CSVUploadResponse(
                     success=False,
                     rows_processed=0,
                     rows_failed=len(df),
-                    errors=[
-                        f"Could not find columns: {', '.join(missing_cols)}",
-                        f"We auto-detect common names. Missing: {'; '.join(suggestions)}"
-                    ]
+                    errors=[f"Missing required columns: {', '.join(missing)}"],
                 )
-            
-            # Process rows
-            rows_processed = 0
-            rows_failed = 0
-            errors = []
-            store_id = None
-            
-            # 1. Vectorized Data Normalization
-            # Standardize date and numeric formats using vectorized pandas operations
-            if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
-                
-            for col in ['units_sold', 'price', 'discount']:
+            if validation_errors:
+                return CSVUploadResponse(
+                    success=False,
+                    rows_processed=0,
+                    rows_failed=len(df),
+                    errors=validation_errors,
+                )
+
+            if "store_id" not in df.columns:
+                df["store_id"] = "STORE001"
+            df = derive_sku_name(df)
+
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+            for col in ["units_sold", "price", "discount"]:
                 if col in df.columns:
-                    # Remove non-numeric chars but keep dots/digits
-                    if df[col].dtype == object:
-                        df[col] = df[col].astype(str).str.replace(r'[^\d.]', '', regex=True)
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            
-            # Fill missing Store ID with default
-            if 'store_id' not in df.columns:
-                df['store_id'] = "STORE001"
-            else:
-                df['store_id'] = df['store_id'].fillna("STORE001").astype(str)
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            # 2. Conversion to List of Dicts (Bypass row iteration)
-            records = df.to_dict('records')
+            anomalies = detect_anomalies(df)
+            anomaly_map = {a.row_index: a.note for a in anomalies}
             valid_rows: List[SalesRowSchema] = []
-            
-            for idx, row_data in enumerate(records):
-                try:
-                    # Filter out rows with invalid dates early
-                    if pd.isna(row_data.get('date')):
-                         raise ValueError(f"Invalid or missing date format in row {idx + 2}")
+            errors: List[str] = []
+            rows_failed = 0
+            store_id: Optional[str] = None
 
-                    # Bulk validated by Pydantic
-                    validated = SalesRowSchema(**row_data)
-                    valid_rows.append(validated)
-                    rows_processed += 1
-                    if store_id is None:
-                        store_id = validated.store_id
-                except Exception as e:
+            for index, row in enumerate(df.to_dict("records")):
+                if index in excluded_rows:
+                    continue
+                try:
+                    row["store_id"] = str(row.get("store_id") or "STORE001")
+                    row["sku_id"] = str(row.get("sku_id"))
+                    row["sku_name"] = str(row.get("sku_name") or row["sku_id"])
+                    if pd.isna(row.get("date")):
+                        raise ValueError("Invalid date")
+                    valid_row = SalesRowSchema(**row)
+                    valid_rows.append(valid_row)
+                    store_id = store_id or valid_row.store_id
+                except Exception as exc:
                     rows_failed += 1
                     if len(errors) < 10:
-                        err_msg = f"Row {idx + 2}: {str(e)}"
-                        errors.append(err_msg)
-                        print(f"Validation error: {err_msg}")
+                        errors.append(f"Row {index + 2}: {exc}")
 
             if not valid_rows:
-                return CSVUploadResponse(success=False, rows_processed=0, rows_failed=rows_failed, errors=errors)
+                return CSVUploadResponse(success=False, rows_processed=0, rows_failed=rows_failed, errors=errors, anomalies=anomalies)
 
-            # 3. Optimized Store Management
-            unique_store_ids = set(r.store_id for r in valid_rows)
-            store_map = {}
-            for sid in unique_store_ids:
-                store = self.db.query(Store).filter(Store.store_id == sid).first()
+            store_map: Dict[str, Store] = {}
+            for current_store_id in sorted({row.store_id for row in valid_rows}):
+                store = self.db.query(Store).filter(Store.user_id == user.id, Store.store_id == current_store_id).first()
                 if not store:
-                    store = Store(store_id=sid, name=f"Store {sid}")
+                    store = Store(user_id=user.id, store_id=current_store_id, name=f"Store {current_store_id}")
                     self.db.add(store)
                     self.db.flush()
-                store_map[sid] = store
+                store_map[current_store_id] = store
 
-            # 4. SKU Management (Bulk)
-            # Predetermine all SKUs needed to minimize queries
-            unique_skus_keys = set((store_map[r.store_id].id, r.sku_id) for r in valid_rows)
-            existing_skus = self.db.query(SKU).filter(
-                SKU.store_id.in_([s.id for s in store_map.values()])
-            ).all()
-            sku_map = {(s.store_id, s.sku_id): s for s in existing_skus}
-            
-            new_skus = []
-            for s_db_id, sku_id_str in unique_skus_keys:
-                if (s_db_id, sku_id_str) not in sku_map:
-                    # Find first matching row for name/category
-                    row = next(r for r in valid_rows if r.sku_id == sku_id_str and store_map[r.store_id].id == s_db_id)
-                    new_skus.append(SKU(
-                        sku_id=sku_id_str,
-                        sku_name=row.sku_name,
-                        store_id=s_db_id,
-                        category=row.category
-                    ))
+            sku_map: Dict[tuple[int, str], SKU] = {}
+            existing_skus = (
+                self.db.query(SKU)
+                .filter(SKU.user_id == user.id, SKU.store_id.in_([s.id for s in store_map.values()]))
+                .all()
+            )
+            for sku in existing_skus:
+                sku_map[(sku.store_id, sku.sku_id)] = sku
 
-            if new_skus:
-                self.db.bulk_save_objects(new_skus)
-                self.db.flush()
-                # Refresh map
-                updated_skus = self.db.query(SKU).filter(SKU.store_id.in_([s.id for s in store_map.values()])).all()
-                sku_map = {(s.store_id, s.sku_id): s for s in updated_skus}
-
-            # 5. Fast Transaction Injection
-            bulk_transactions = []
-            seen_keys = set()
-            
             for row in valid_rows:
-                s_obj = store_map[row.store_id]
-                sku_obj = sku_map[(s_obj.id, row.sku_id)]
-                key = (s_obj.id, sku_obj.id, row.date)
-                
-                if key in seen_keys: continue
-                seen_keys.add(key)
-                
-                bulk_transactions.append(SalesTransaction(
-                    store_id=s_obj.id,
-                    sku_id=sku_obj.id,
-                    date=row.date,
-                    units_sold=row.units_sold,
-                    price=row.price,
-                    discount=row.discount
-                ))
+                store = store_map[row.store_id]
+                key = (store.id, row.sku_id)
+                if key not in sku_map:
+                    sku = SKU(user_id=user.id, store_id=store.id, sku_id=row.sku_id, sku_name=row.sku_name, category=row.category)
+                    self.db.add(sku)
+                    self.db.flush()
+                    sku_map[key] = sku
+                else:
+                    sku = sku_map[key]
+                    sku.sku_name = row.sku_name
+                    sku.category = row.category or sku.category
 
-            if bulk_transactions:
-                 # Group by store for cleanup and insertion
-                 for sid_obj, store_obj in store_map.items():
-                     store_rows = [r for r in valid_rows if r.store_id == sid_obj]
-                     if not store_rows: continue
-                     
-                     min_date = min(r.date for r in store_rows)
-                     max_date = max(r.date for r in store_rows)
-                     relevant_sku_ids = [sku_map[(store_obj.id, r.sku_id)].id for r in store_rows]
-                     
-                     # Delete existing overlap to avoid unique constraint violations or duplicates
-                     self.db.query(SalesTransaction).filter(
-                         SalesTransaction.store_id == store_obj.id,
-                         SalesTransaction.date >= min_date,
-                         SalesTransaction.date <= max_date,
-                         SalesTransaction.sku_id.in_(relevant_sku_ids)
-                     ).delete(synchronize_session=False)
+            transactions: List[SalesTransaction] = []
+            for index, row in enumerate(valid_rows):
+                store = store_map[row.store_id]
+                sku = sku_map[(store.id, row.sku_id)]
+                transactions.append(
+                    SalesTransaction(
+                        user_id=user.id,
+                        store_id=store.id,
+                        sku_id=sku.id,
+                        date=row.date,
+                        units_sold=row.units_sold,
+                        price=row.price,
+                        discount=row.discount,
+                        excluded_from_forecast=False,
+                        anomaly_note=anomaly_map.get(index),
+                    )
+                )
 
-                 self.db.bulk_save_objects(bulk_transactions)
-            
+            for store in store_map.values():
+                sku_ids = [sku.id for (store_db_id, _), sku in sku_map.items() if store_db_id == store.id]
+                self.db.query(SalesTransaction).filter(
+                    SalesTransaction.user_id == user.id,
+                    SalesTransaction.store_id == store.id,
+                    SalesTransaction.sku_id.in_(sku_ids),
+                ).delete(synchronize_session=False)
+
+            self.db.bulk_save_objects(transactions)
             self.db.commit()
-            
+
             return CSVUploadResponse(
                 success=True,
-                rows_processed=rows_processed,
+                rows_processed=len(valid_rows),
                 rows_failed=rows_failed,
                 errors=errors,
-                store_id=store_id
+                store_id=store_id,
+                anomalies=anomalies,
             )
-            
-        except pd.errors.EmptyDataError:
-            return CSVUploadResponse(
-                success=False,
-                rows_processed=0,
-                rows_failed=0,
-                errors=["Empty CSV file"]
-            )
-        except Exception as e:
+        except Exception as exc:
             self.db.rollback()
-            return CSVUploadResponse(
-                success=False,
-                rows_processed=0,
-                rows_failed=0,
-                errors=[f"Failed to parse CSV: {str(e)}"]
-            )
-    
-    def _row_to_dict(self, row: pd.Series) -> dict:
-        """Convert pandas row to dict for validation."""
-        data = {}
-        for col in self.REQUIRED_COLUMNS + self.OPTIONAL_COLUMNS:
-            if col in row.index:
-                val = row[col]
-                
-                # CLEANING BEFORE VALIDATION
-                if col == 'date':
-                     val = self._parse_date(val)
-                elif col in ['units_sold', 'price', 'discount']:
-                     val = self._clean_number(val)
-                
-                # Handle NaN values
-                if pd.isna(val) or val == '':
-                    data[col] = None
-                else:
-                    data[col] = val
-        
-        # Default Store ID if missing (Critical for "accept anything")
-        if 'store_id' not in data or data['store_id'] is None:
-             data['store_id'] = "STORE001"  # Default for single-store setups
+            return CSVUploadResponse(success=False, rows_processed=0, rows_failed=0, errors=[f"Failed to parse CSV: {exc}"])
 
-        return data
-    
-    def _parse_date(self, date_str):
-        """Try to parse date from various formats."""
-        if isinstance(date_str, (datetime, pd.Timestamp)):
-            return date_str.date()
-            
-        formats = [
-            '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y',
-            '%Y/%m/%d', '%d-%b-%Y', '%d-%b-%y'
-        ]
-        
-        for fmt in formats:
-            try:
-                return datetime.strptime(str(date_str).split()[0], fmt).date()
-            except ValueError:
-                continue
-        
-        # Last resort: pandas to_datetime which is very powerful
-        try:
-            return pd.to_datetime(date_str).date()
-        except:
-            raise ValueError(f"Could not parse date: {date_str}")
-
-    def _clean_number(self, val):
-        """Clean operations for numbers (e.g. '10 pcs' -> 10)."""
-        if val is None:
+    def _suggest_mapping_with_ai(self, user: User, df: pd.DataFrame) -> Optional[dict[str, str]]:
+        api_key = None
+        settings_row = self.db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+        if settings_row and settings_row.encrypted_gemini_api_key:
+            api_key = decrypt_value(settings_row.encrypted_gemini_api_key)
+        if not api_key:
+            import os
+            api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
             return None
-        if isinstance(val, (int, float)):
-            return val
-        
-        # Remove currency symbols and text
-        s = str(val).lower()
-        cleaned = ''.join(c for c in s if c.isdigit() or c == '.')
         try:
-            return float(cleaned) if '.' in cleaned else int(cleaned)
-        except:
-            return 0
+            import json
+            import google.generativeai as genai
 
-    def _process_row(self, row: SalesRowSchema) -> None:
-        """
-        Process a single validated row.
-        Creates store/SKU if needed, inserts sales transaction.
-        """
-        # Parse date and clean numbers robustly
-        try:
-            row_date = self._parse_date(row.date)
-            row_units = self._clean_number(row.units_sold)
-            row_price = self._clean_number(row.price)
-            row_discount = self._clean_number(row.discount)
-        except Exception as e:
-            raise ValueError(f"Data cleaning error: {str(e)}")
-
-        # Get or create store
-        store = self._get_or_create_store(row.store_id)
-        
-        # Get or create SKU
-        sku = self._get_or_create_sku(
-            sku_id=str(row.sku_id),
-            sku_name=str(row.sku_name),
-            store_id=store.id,
-            category=row.category
-        )
-        
-        # Check for duplicate transaction
-        existing = self.db.query(SalesTransaction).filter(
-            SalesTransaction.store_id == store.id,
-            SalesTransaction.sku_id == sku.id,
-            SalesTransaction.date == row_date
-        ).first()
-        
-        if existing:
-            # Update existing transaction
-            existing.units_sold = row_units
-            if row_price is not None:
-                existing.price = row_price
-            if row_discount is not None:
-                existing.discount = row_discount
-        else:
-            # Create new transaction
-            transaction = SalesTransaction(
-                store_id=store.id,
-                sku_id=sku.id,
-                date=row_date,
-                units_sold=row_units,
-                price=row_price,
-                discount=row_discount
+            genai.configure(api_key=api_key)
+            prompt = (
+                "Map these CSV columns to schema fields only when confident. "
+                "Schema fields: store_id, sku_id, sku_name, date, units_sold, price, discount, category. "
+                f"CSV columns: {list(df.columns)}. "
+                f"Sample rows: {df.head(3).to_dict('records')}. "
+                "Rules: each source column can only be mapped once. "
+                "Return a strict JSON object mapping source column name to schema field name. "
+                "Only include mappings you are confident about. Return nothing else."
             )
-            self.db.add(transaction)
-    
-    def _get_or_create_store(self, store_id: str) -> Store:
-        """Get existing store or create new one."""
-        store = self.db.query(Store).filter(Store.store_id == store_id).first()
-        if not store:
-            store = Store(
-                store_id=store_id,
-                name=f"Store {store_id}"  # Default name
-            )
-            self.db.add(store)
-            self.db.flush()  # Get the ID
-        return store
-    
-    def _get_or_create_sku(
-        self, 
-        sku_id: str, 
-        sku_name: str, 
-        store_id: int,
-        category: Optional[str] = None
-    ) -> SKU:
-        """Get existing SKU or create new one."""
-        sku = self.db.query(SKU).filter(
-            SKU.sku_id == sku_id,
-            SKU.store_id == store_id
-        ).first()
-        
-        if not sku:
-            sku = SKU(
-                sku_id=sku_id,
-                sku_name=sku_name,
-                store_id=store_id,
-                category=category
-            )
-            self.db.add(sku)
-            self.db.flush()
-        else:
-            # Update name if changed
-            if sku.sku_name != sku_name:
-                sku.sku_name = sku_name
-            if category and sku.category != category:
-                sku.category = category
-        
-        return sku
-
-
-def validate_csv_columns(file_content: str) -> Tuple[bool, List[str], List[str]]:
-    """
-    Quick validation of CSV columns without processing.
-    
-    Returns:
-        Tuple of (is_valid, found_columns, missing_columns)
-    """
-    try:
-        df = pd.read_csv(StringIO(file_content), nrows=0)
-        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-        
-        found = list(df.columns)
-        missing = list(set(CSVUploadService.REQUIRED_COLUMNS) - set(found))
-        
-        return len(missing) == 0, found, missing
-    except Exception:
-        return False, [], CSVUploadService.REQUIRED_COLUMNS
+            last_error: Exception | None = None
+            for model_name in candidate_gemini_models():
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+                    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+                    return json.loads(raw)
+                except Exception as exc:
+                    last_error = exc
+            raise last_error or RuntimeError("No Gemini model could be used.")
+        except Exception:
+            return None
